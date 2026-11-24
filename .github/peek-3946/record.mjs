@@ -114,9 +114,12 @@ function exportMovie(raw, out, t, meta, left, right, bottom) {
 try {
   app = await launch(appPath,{data:join(scratch,"profile"),session:fixture,onboarded:true,js:"none",startTimeout:90000,...(mode==="visible"?{env:{ARDIA_BACKGROUND:null}}:{})});
   source = await app.page("/source");
+  await wait(()=>source.eval('document.readyState==="complete" && !!document.querySelector("#link")'),"source link ready");
   assert.equal(await app.eval("return ac.store.getState().settings.pageFrame;"),0);
   const warm = await open(false);
   assert.ok(warm.windowNumber>0);
+  await sleep(1200);
+  execFileSync(recorder,[String(warm.windowNumber),String(app.pid),held,"--still"],{timeout:10000});
   await close();
   await describe("source-ready");
   proc = spawn(recorder,[String(warm.windowNumber),String(app.pid),raw,scratch],{stdio:"inherit"});
@@ -126,9 +129,10 @@ try {
   await sleep(1600);
   const shown=await open(true);
   assert.equal(shown.windowNumber,warm.windowNumber);
+  assert.deepEqual(shown.geometry.rest,warm.geometry.rest);
+  assert.deepEqual(shown.stageInWindow,warm.stageInWindow);
   await sleep(1200);
   const t=(Date.now()-t0)/1000;
-  execFileSync(recorder,[String(shown.windowNumber),String(app.pid),held,"--still"],{timeout:10000});
   await sleep(2800);
   await close();
   await sleep(500);
