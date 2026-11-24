@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -20,10 +20,12 @@ const site = createServer((req, res) => {
 await new Promise(done => site.listen(0, "127.0.0.1", done));
 const base = "http://127.0.0.1:" + site.address().port;
 const fixture = session({windows:[{id:"w1",frame:[20,30,1000,640]}], tabs:[{id:"a",url:base+"/source"}], settings:{pageFrame:0,addressBar:"toolbar",newTabLinksOpenIn:"peek"}});
+const raw = join(scratch,"window.mp4");
+const held = join(scratch,"held.png");
 const mode = process.env.AR_CAPTURE_MODE || "hidden";
 const diagnosticDir = join(process.env.RUNNER_TEMP || tmpdir(), "peek-diagnostics", variant, mode);
 mkdirSync(diagnosticDir,{recursive:true});
-let app, source, proc, handedOff=false, windowID=0;
+let app, source, proc, exited, handedOff=false, windowID=0;
 let route="click";
 async function wait(test, name, timeout = 16000) {
   const end = Date.now()+timeout;
@@ -83,6 +85,32 @@ async function close() {
   await wait(()=>app.eval('return !ac.store.getState().peeks.a;'),"Peek close");
   await sleep(400);
 }
+function exportMovie(raw, out, t, meta, left, right, bottom) {
+  const movieSize=JSON.parse(execFileSync("ffprobe",["-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","json",raw])).streams[0];
+  const {width,height}=movieSize;
+  const scaleX=width/meta.width,scaleY=height/meta.height;
+  const even=v=>2*Math.floor(v/2);
+  const tile=even(Math.min(width*.45,height*.67)), patch=even(68*scaleX), header=even(height*.09);
+  const gap=even(width/2)-tile;
+  const x=edge=>Math.max(0,Math.min(width-patch,even(edge*scaleX-patch/2)));
+  const y=Math.max(0,Math.min(height-patch,even(bottom*scaleY-patch/2)));
+  const strip=join(scratch,"labels.png"),still=join(scratch,"held-movie-frame.png");
+  execFileSync(recorder,["--labels",strip,String(width),String(header)]);
+  execFileSync("ffmpeg",["-v","error","-y","-ss",String(t),"-i",raw,"-frames:v","1",still]);
+  const crop=edge=>"crop="+patch+":"+patch+":"+x(edge)+":"+y+",scale="+tile+":"+tile+":flags=neighbor,setsar=1";
+  const filter=[
+    "[0:v]setpts=PTS-STARTPTS,setsar=1,format=yuv420p[full]",
+    "[1:v]split=2[l][r]",
+    "[l]"+crop(left)+"[left]",
+    "[r]"+crop(right)+"[right]",
+    "[left]pad="+(tile+gap)+":"+tile+":0:0:color=0x131a20[spaced]",
+    "[spaced][right]hstack,pad="+width+":"+tile+":(ow-iw)/2:0:color=0x131a20[patches]",
+    "[2:v][patches]vstack,pad="+width+":"+height+":0:(oh-ih)/2:color=0x131a20,format=yuv420p,setsar=1[detail]",
+    "[full][detail]concat=n=2:v=1:a=0[v]"
+  ].join(";");
+  execFileSync("ffmpeg",["-v","error","-y","-i",raw,"-loop","1","-framerate","30","-t","2.5","-i",still,"-loop","1","-framerate","30","-t","2.5","-i",strip,
+    "-filter_complex",filter,"-map","[v]","-an","-r","30","-c:v","libx264","-crf","16","-pix_fmt","yuv420p","-movflags","+faststart",out]);
+}
 try {
   app = await launch(appPath,{data:join(scratch,"profile"),session:fixture,onboarded:true,js:"none",startTimeout:90000,...(mode==="visible"?{env:{ARDIA_BACKGROUND:null}}:{})});
   source = await app.page("/source");
@@ -91,9 +119,8 @@ try {
   assert.ok(warm.windowNumber>0);
   await close();
   await describe("source-ready");
-  const raw = join(scratch,"window.mp4");
   proc = spawn(recorder,[String(warm.windowNumber),String(app.pid),raw,scratch],{stdio:"inherit"});
-  const exited = new Promise((done,fail)=>{proc.once("error",fail); proc.once("exit",(code,signal)=>done({code,signal}));});
+  exited = new Promise((done,fail)=>{proc.once("error",fail); proc.once("exit",(code,signal)=>done({code,signal}));});
   await wait(()=>{assert.equal(proc.exitCode,null,"window recorder exited before capture");return existsSync(join(scratch,"started"));},"recorder start");
   const t0=Date.now();
   await sleep(1600);
@@ -101,8 +128,11 @@ try {
   assert.equal(shown.windowNumber,warm.windowNumber);
   await sleep(1200);
   const t=(Date.now()-t0)/1000;
+  execFileSync(recorder,[String(shown.windowNumber),String(app.pid),held,"--still"],{timeout:10000});
   await sleep(2800);
   await close();
+  await sleep(500);
+  const tClosed=(Date.now()-t0)/1000;
   await sleep(1200);
   writeFileSync(join(scratch,"stop"),"");
   const status=await exited;
@@ -110,8 +140,8 @@ try {
   const meta=JSON.parse(readFileSync(join(scratch,"window.json")));
   const w=Math.round(meta.width),h=Math.round(meta.height);
   const readFrame = (sec) => execFileSync("ffmpeg",["-v","error","-ss",String(sec),"-i",raw,"-frames:v","1","-vf",`scale=${w}:${h}`,"-pix_fmt","rgb24","-f","rawvideo","-"],{maxBuffer:w*h*3+4096});
-  const still=readFrame(t),first=readFrame(.5);
-  assert.equal(still.length,w*h*3); assert.equal(first.length,w*h*3);
+  const still=readFrame(t),first=readFrame(.5),last=readFrame(tClosed);
+  for(const frame of [first,still,last]) assert.equal(frame.length,w*h*3);
   const origin=shown.stageInWindow,rect=shown.geometry.rest;
   const sample=(frame,x,y)=>{
     const i=Math.round(x)+Math.round(y)*w; assert.ok(x>=0&&x<w&&y>=0&&y<h);
@@ -121,12 +151,46 @@ try {
   const left=origin.x+rect.x,right=left+rect.width,bottom=origin.y+rect.y+rect.height;
   const inside=[left+rect.width/2,bottom-12];
   console.log(JSON.stringify({sampleTime:t,window:meta,origin,rect,first:sample(first,...inside),article:sample(still,...inside)}));
-  assert.ok(target(sample(still,...inside)) && !target(sample(first,...inside)),"video must show the actual target page opening");
+  assert.ok(target(sample(still,...inside)) && !target(sample(first,...inside)) && !target(sample(last,...inside)),"the recording must show the target page opening and closing");
   assert.ok(Math.abs(rect.x-shown.geometry.card.x)<.01 && Math.abs(rect.y+rect.height-shown.geometry.card.y-shown.geometry.card.height)<.01,"zero-frame card geometry");
-  const pixels=[sample(still,left+1.5,bottom-1.5),sample(still,right-1.5,bottom-1.5)];
-  console.log(JSON.stringify({variant,window:warm.windowNumber,width:w,height:h,inside:sample(still,...inside),bottomCorners:pixels}));
-  assert.deepEqual(pixels.map(target),Array(2).fill(variant==="before"),"both bottom corners must match the expected revision");
-  execFileSync("ffmpeg",["-v","error","-y","-i",raw,"-an","-c:v","libx264","-crf","16","-pix_fmt","yuv420p","-movflags","+faststart",out]);
+  const dim=JSON.parse(execFileSync("ffprobe",["-v","error","-select_streams","v:0","-show_entries","stream=width,height","-of","json",held])).streams[0];
+  const sx=dim.width/meta.width,sy=dim.height/meta.height;
+  assert.ok(Math.abs(sx-sy)<.02 && sx>=.99,"native screenshot scale");
+  const rgb=execFileSync("ffmpeg",["-v","error","-i",held,"-frames:v","1","-pix_fmt","rgb24","-f","rawvideo","-"],{maxBuffer:dim.width*dim.height*3+4096});
+  assert.equal(rgb.length,dim.width*dim.height*3);
+  const at=(x,y)=>{
+    const i=Math.floor(x*sx),j=Math.floor(y*sy);
+    assert.ok(i>=0&&i<dim.width&&j>=0&&j<dim.height);
+    return [...rgb.subarray(3*(j*dim.width+i),3*(j*dim.width+i)+3)];
+  };
+  const distance=(a,b)=>Math.hypot(...a.map((v,i)=>v-b[i]));
+  const median=a=>a.slice().sort((v,w)=>v-w)[Math.floor(a.length/2)];
+  const center=colors=>[0,1,2].map(k=>median(colors.map(c=>c[k])));
+  const measure=(edge,direction)=>{
+    const p=(dx,dy)=>at(edge+direction*dx,bottom-dy);
+    const inside=center([p(12,8),p(14,10),p(16,12),p(20,8),p(24,10)]);
+    const outside=center([p(-2,-2),p(-3,-1),p(-1,-3),p(-4,0),p(0,-4)]);
+    assert.ok(distance(inside,outside)>20,"the same-frame references must be distinguishable");
+    assert.ok(target(inside),"inside reference must be the fixture page");
+    const samples=[];
+    for (let i=Math.floor((edge-5)*sx);i<=Math.ceil((edge+5)*sx);i++)
+      for (let j=Math.floor((bottom-5)*sy);j<=Math.ceil(bottom*sy);j++) {
+        const x=(i+.5)/sx,y=(j+.5)/sy,dx=(x-edge)*direction,dy=bottom-y;
+        if(dx<1||dy<1||dx+dy>5.05) continue;
+        const color=at(x,y);
+        const straight=center([p(18,dy),p(24,dy),p(dx,18),p(dx,24),inside]);
+        const dIn=distance(color,straight),dOut=distance(color,outside);
+        samples.push({column:i,row:j,dx,dy,color,straight,score:(dOut-dIn)/(dIn+dOut||1)});
+      }
+    assert.ok(samples.length>=3,"enough distinct native corner pixels");
+    return {inside,outside,score:median(samples.map(p=>p.score)),samples};
+  };
+  const corners=[measure(left,1),measure(right,-1)];
+  const info={variant,window:windowID,dim,origin,rect,t,tClosed,corners};
+  writeFileSync(join(diagnosticDir,"native-corners.json"),JSON.stringify(info,null,2));
+  console.log(JSON.stringify({variant,sampleCount:corners.map(c=>c.samples.length),scores:corners.map(c=>c.score),inside:corners.map(c=>c.inside),outside:corners.map(c=>c.outside)}));
+  assert.deepEqual(corners.map(c=>Math.sign(c.score)),Array(2).fill(variant==="before"?1:-1),"lossless native corners must favor the matching reference");
+  exportMovie(raw,out,t,meta,left,right,bottom);
   handedOff=true;
 } catch(e) {
   await describe("failure");
@@ -136,7 +200,12 @@ try {
   throw e;
 } finally {
   if (proc && proc.exitCode===null) { writeFileSync(join(scratch,"stop"),""); }
-  if (!handedOff) console.error("Unverified outputs were excluded from the video artifact.");
+  if (!handedOff) {
+    if (exited && proc?.exitCode===null) await Promise.race([exited,sleep(9000)]).catch(()=>{});
+    if (existsSync(held)) copyFileSync(held,join(diagnosticDir,"held-native-window.png"));
+    if (existsSync(raw)) copyFileSync(raw,join(diagnosticDir,"unverified-window.mp4"));
+    console.error("Diagnostic captures are separate from verified video.");
+  }
   source?.close();
   if (app) await app.quit();
   await new Promise(done=>site.close(done));
