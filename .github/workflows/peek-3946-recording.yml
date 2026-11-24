@@ -56,33 +56,77 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: 24
+      - name: Identify the Mac build
+        id: build-key
+        working-directory: app
+        run: |
+          set -euo pipefail
+          sdk="$(xcrun --sdk macosx --show-sdk-build-version)"
+          xcode="$(xcodebuild -version | awk '/Build version/ {print $3}')"
+          echo "key=peek-3946-signed-v1-$(git rev-parse HEAD)-$xcode-$sdk" >> "$GITHUB_OUTPUT"
+          if ! command -v ffmpeg >/dev/null; then brew install ffmpeg; fi
+      - name: Restore the exact signed app
+        id: app-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/Ardia-signed.zip
+          key: ${{ steps.build-key.outputs.key }}
       - name: Prepare the official macOS build
+        if: steps.app-cache.outputs.cache-hit != 'true'
         working-directory: app
         run: |
           set -euo pipefail
           git rev-parse HEAD | tee -a "$GITHUB_STEP_SUMMARY"
-          if ! command -v ffmpeg >/dev/null; then brew install ffmpeg; fi
           command -v pod
           pnpm install --frozen-lockfile
           echo "ARDIACORE_FRAMEWORK=$(packages/ardiacore/scripts/fetch-engine.sh --nearest)" >> "$GITHUB_ENV"
           PATH="$HOME/.cargo/bin:$PATH" packages/core-rs/scripts/build-xcframework.sh
           (cd apps/browser/macos && pod install && git diff --exit-code -- Podfile.lock)
       - name: Build an ad hoc Debug app with this revision's JavaScript
+        if: steps.app-cache.outputs.cache-hit != 'true'
         working-directory: app
         run: |
           set -euo pipefail
           scripts/agent/build-app --as peek3946 --config Debug --plain --adhoc --bundle | tee "$RUNNER_TEMP/build.log"
           app_path=$(sed -n 's/^app: //p' "$RUNNER_TEMP/build.log" | tail -1)
           test -d "$app_path/Contents"
+          codesign --verify "$app_path"
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "$RUNNER_TEMP/Ardia-signed.zip"
+          echo "ARDIA_EVIDENCE_APP=$app_path" >> "$GITHUB_ENV"
+      - name: Save the exact signed app before the recording step
+        if: steps.app-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ${{ runner.temp }}/Ardia-signed.zip
+          key: ${{ steps.build-key.outputs.key }}
+      - name: Unpack and verify the cached app
+        if: steps.app-cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/peek-build"
+          ditto -x -k "$RUNNER_TEMP/Ardia-signed.zip" "$RUNNER_TEMP/peek-build"
+          app_path="$RUNNER_TEMP/peek-build/Ardia.app"
+          codesign --verify "$app_path"
           echo "ARDIA_EVIDENCE_APP=$app_path" >> "$GITHUB_ENV"
       - name: Record and verify the Ardia window
-        timeout-minutes: 6
+        timeout-minutes: 11
         working-directory: app
         env:
           VARIANT: ${{ matrix.label }}
         run: |
           set -euo pipefail
-          node ../driver/.github/peek-3946/record.mjs "$ARDIA_EVIDENCE_APP" "$RUNNER_TEMP/window-movie" "$RUNNER_TEMP/peek-$VARIANT.mp4" "$VARIANT"
+          for mode in hidden visible; do
+            if AR_CAPTURE_MODE="$mode" node ../driver/.github/peek-3946/record.mjs "$ARDIA_EVIDENCE_APP" "$RUNNER_TEMP/window-movie" "$RUNNER_TEMP/peek-$VARIANT.mp4" "$VARIANT"; then exit 0; fi
+          done
+          exit 1
+      - name: Keep targeted capture diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Peek-debug-${{ matrix.label }}
+          path: ${{ runner.temp }}/peek-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 3
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: Ardia-Peek-${{ matrix.label }}
