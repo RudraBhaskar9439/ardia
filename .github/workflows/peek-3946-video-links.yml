@@ -1,0 +1,30 @@
+name: Publish the two verified Peek recordings
+on:
+  push:
+    branches: [evidence/3946-publish-videos]
+    paths: [.github/workflows/peek-3946-video-links.yml]
+permissions: {}
+jobs:
+  publish:
+    if: github.repository == 'RudraBhaskar9439/ardia'
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Attach the verified window recordings to a fork-only evidence prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: RudraBhaskar9439/ardia
+        run: |
+          set -euo pipefail
+          test "$(gh run view 45480866556 --json conclusion --jq .conclusion)" = success
+          gh run download 45480866556 --name Ardia-Peek-before --dir before
+          gh run download 45480866556 --name Ardia-Peek-after --dir after
+          test -s before/peek-before.mp4 && test -s after/peek-after.mp4
+          gh release create evidence-peek-3946-4dbf015 before/peek-before.mp4 after/peek-after.mp4 \
+            --target 4dbf015e9536f20d8c8c11b4b70145e4f4263b47 --prerelease --latest=false \
+            --title "Mac Peek recordings for ardia-browser/ardia#4141" \
+            --notes "Review footage for https://github.com/ardia-browser/ardia/pull/4141. Both recordings show the same link opening in a floating macOS Peek with Page Frame at 0 px. The close-ups show the bottom corners. Source revisions: baseline 1b788ae and fix 4dbf015. Capture and verification: https://github.com/RudraBhaskar9439/ardia/actions/runs/45480866556."
