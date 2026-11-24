@@ -1,0 +1,26 @@
+name: Check the frameless Peek fix
+on:
+  push:
+    branches: [evidence/3946-checks]
+permissions:
+  contents: read
+jobs:
+  checks:
+    if: github.repository == 'RudraBhaskar9439/ardia' && github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 4dbf015e9536f20d8c8c11b4b70145e4f4263b47
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24
+      - run: pnpm install --frozen-lockfile
+      - run: node --test apps/browser/src/components/peek/peekGeometry.test.mjs
+      - run: pnpm -C apps/browser typecheck
+      - run: pnpm -C apps/desktop typecheck
+      - run: pnpm -C apps/desktop test:graph
+      - run: pnpm -C apps/desktop test:host
